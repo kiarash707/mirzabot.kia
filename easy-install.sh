@@ -12,7 +12,7 @@
 #  Run `mirzabot help` for every command and option.
 # =============================================================================
 
-INSTALLER_VERSION="1.0.0"
+INSTALLER_VERSION="1.1.0"
 
 # --- defaults (everything can be overridden through the environment) ---------
 REPO="${MIRZA_REPO:-kiarash707/mirzabot.kia}"
@@ -183,6 +183,55 @@ pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'insta
 pkg_candidate() { apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2; exit}'; }
 human_bytes() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 B"; }
 
+# --- service management: systemd when present, classic init scripts otherwise ----------------
+# Containers (Docker, LXC, Daytona, ...) usually have no systemd. We detect that once and fall back to
+# /etc/init.d scripts and cron, so the very same installer works on both kinds of servers.
+HAS_SYSTEMD=1
+{ [[ -d /run/systemd/system ]] && have systemctl; } || HAS_SYSTEMD=0
+
+svc_initd() {  # svc_initd NAME ACTION
+    if [[ -x /etc/init.d/$1 ]]; then "/etc/init.d/$1" "$2" >/dev/null 2>&1
+    elif have service; then service "$1" "$2" >/dev/null 2>&1
+    else return 1; fi
+}
+svc_exists() {
+    if [[ $HAS_SYSTEMD -eq 1 ]]; then systemctl cat "$1.service" >/dev/null 2>&1; else [[ -x /etc/init.d/$1 ]]; fi
+}
+svc_active() {
+    if [[ $HAS_SYSTEMD -eq 1 ]]; then systemctl is-active --quiet "$1" 2>/dev/null; return; fi
+    case $1 in
+        cron|crond)      pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1 ;;
+        apache2)         pgrep -x apache2 >/dev/null 2>&1 ;;
+        mysql|mariadb)   pgrep -x mariadbd >/dev/null 2>&1 || pgrep -x mysqld >/dev/null 2>&1 ;;
+        *)               svc_initd "$1" status ;;
+    esac
+}
+svc_start()   { if [[ $HAS_SYSTEMD -eq 1 ]]; then systemctl start "$1" >/dev/null 2>&1; else svc_initd "$1" start; fi; }
+svc_stop()    { if [[ $HAS_SYSTEMD -eq 1 ]]; then systemctl stop "$1" >/dev/null 2>&1; else svc_initd "$1" stop; fi; }
+svc_restart() { if [[ $HAS_SYSTEMD -eq 1 ]]; then systemctl restart "$1" >/dev/null 2>&1; else svc_initd "$1" restart; fi; }
+svc_reload()  {
+    if [[ $HAS_SYSTEMD -eq 1 ]]; then systemctl reload "$1" >/dev/null 2>&1 || systemctl restart "$1" >/dev/null 2>&1
+    else svc_initd "$1" reload || svc_initd "$1" restart; fi
+}
+svc_enable_start() {
+    if [[ $HAS_SYSTEMD -eq 1 ]]; then systemctl enable --now "$1" >/dev/null 2>&1
+    else svc_active "$1" || svc_start "$1"; fi
+}
+
+# Debian/Ubuntu container images often forbid starting services from package scripts (policy-rc.d).
+# While we install the web stack on a systemd-less server we allow it temporarily, then restore the original.
+POLICY_RC=/usr/sbin/policy-rc.d
+policy_allow_start() {
+    [[ $HAS_SYSTEMD -eq 0 ]] || return 0
+    if [[ -e $POLICY_RC ]] && ! grep -q mirzabot-installer "$POLICY_RC" 2>/dev/null; then mv -f "$POLICY_RC" "$POLICY_RC.mirzabot-orig"; fi
+    printf '#!/bin/sh\n# mirzabot-installer (temporary)\nexit 0\n' >"$POLICY_RC" && chmod +x "$POLICY_RC"
+}
+policy_restore() {
+    [[ -e $POLICY_RC ]] && grep -q mirzabot-installer "$POLICY_RC" 2>/dev/null && rm -f "$POLICY_RC"
+    [[ -e $POLICY_RC.mirzabot-orig ]] && mv -f "$POLICY_RC.mirzabot-orig" "$POLICY_RC"
+    return 0
+}
+
 valid_ipv4() {
     local ip=$1 o IFS=.
     [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
@@ -259,8 +308,11 @@ check_os() {
            else die "Unsupported OS '$OS_PRETTY'. Use Ubuntu 22.04/24.04 or Debian 12/13 (or pass --force at your own risk)."; fi ;;
     esac
     case "$(uname -m)" in x86_64|aarch64|arm64) ;; *) die "Unsupported CPU architecture: $(uname -m)" ;; esac
-    [[ -d /run/systemd/system ]] || die "systemd is required (containers without systemd are not supported)."
     msg_ok "System: $OS_PRETTY ($(uname -m))"
+    if [[ $HAS_SYSTEMD -eq 0 ]]; then
+        msg_warn "No systemd found (container?). Using classic init scripts and cron instead."
+        msg_warn "After a restart of this server run:  mirzabot services start"
+    fi
 }
 
 check_resources() {
@@ -308,13 +360,14 @@ check_ports() {
     for p in 80 443; do
         owner=$(port_owner "$p")
         if [[ -n $owner && $owner != apache2 ]]; then
-            die "Port $p is already used by '$owner'. Stop/remove it first (e.g. systemctl disable --now $owner) and run the installer again."
+            die "Port $p is already used by '$owner'. Stop/remove it first (e.g. systemctl disable --now $owner, or service $owner stop) and run the installer again."
         fi
     done
     msg_ok "Ports 80 and 443 are free for the bot"
 }
 
 check_clock() {
+    [[ $HAS_SYSTEMD -eq 1 ]] && have timedatectl || return 0
     local sync; sync=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
     if [[ $sync == no ]]; then
         msg_warn "System clock is not synchronised - enabling NTP (needed for valid SSL certificates)."
@@ -324,6 +377,7 @@ check_clock() {
 
 ensure_swap() {
     local mem_kb; mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+    [[ $HAS_SYSTEMD -eq 1 ]] || return 0   # containers cannot create swap
     [[ $mem_kb -lt 1500000 ]] || return 0
     [[ -z "$(swapon --show --noheadings 2>/dev/null)" ]] || return 0
     local size=2048 free_mb; free_mb=$(df -Pm / | awk 'NR==2{print $4}')
@@ -410,6 +464,14 @@ EOF
 }
 
 install_webstack() {
+    policy_allow_start
+    local rc=0
+    install_webstack_inner || rc=$?
+    policy_restore
+    return $rc
+}
+
+install_webstack_inner() {
     apt_install apache2 || return 1
     if ! pkg_installed mysql-server && ! pkg_installed mariadb-server && ! pkg_installed mysql-community-server; then
         local c; c=$(pkg_candidate mysql-server)
@@ -431,16 +493,20 @@ ServerSignature Off
 TraceEnable Off
 EOF
     a2enconf mirzabot-security >/dev/null
-    systemctl enable --now apache2 >/dev/null 2>&1
+    svc_enable_start apache2
     db_service_enable
-    systemctl restart apache2
+    svc_restart apache2
 }
 
 db_service() {
-    local s; for s in mysql mariadb; do systemctl cat "$s.service" >/dev/null 2>&1 && { echo "$s"; return; }; done
+    local s; for s in mysql mariadb; do svc_exists "$s" && { echo "$s"; return; }; done
     echo mysql
 }
-db_service_enable() { local s; s=$(db_service); systemctl enable --now "$s" >/dev/null 2>&1; systemctl is-active --quiet "$s"; }
+db_service_enable() {
+    local s; s=$(db_service)
+    svc_enable_start "$s"
+    svc_active "$s" || { svc_restart "$s"; sleep 2; svc_active "$s"; }
+}
 
 ensure_composer() {
     [[ -x $COMPOSER_BIN ]] && "$PHP_BIN" "$COMPOSER_BIN" --version >/dev/null 2>&1 && return 0
@@ -654,7 +720,7 @@ apache_reload() {
         apachectl configtest 2>&1 | tail -n 5 | sed 's/^/      | /' >&2
         return 1
     fi
-    systemctl reload apache2 >>"$LOG_FILE" 2>&1 || systemctl restart apache2 >>"$LOG_FILE" 2>&1
+    svc_reload apache2
 }
 
 # --- certbot -------------------------------------------------------------------
@@ -700,10 +766,16 @@ install_renewal() {
     cat >/etc/letsencrypt/renewal-hooks/deploy/mirzabot-reload.sh <<'EOF'
 #!/bin/sh
 # Managed by the Mirza Bot easy installer
-systemctl reload apache2 >/dev/null 2>&1 || systemctl restart apache2
+if [ -d /run/systemd/system ]; then
+    systemctl reload apache2 >/dev/null 2>&1 || systemctl restart apache2
+else
+    /etc/init.d/apache2 reload >/dev/null 2>&1 || /etc/init.d/apache2 restart
+fi
 EOF
     chmod +x /etc/letsencrypt/renewal-hooks/deploy/mirzabot-reload.sh
-    cat >/etc/systemd/system/mirzabot-cert-renew.service <<EOF
+    if [[ $HAS_SYSTEMD -eq 1 ]]; then
+        rm -f /etc/cron.d/mirzabot-cert-renew
+        cat >/etc/systemd/system/mirzabot-cert-renew.service <<EOF
 [Unit]
 Description=Renew the Mirza Bot SSL certificate
 After=network-online.target
@@ -712,7 +784,7 @@ After=network-online.target
 Type=oneshot
 ExecStart=${CERTBOT} renew --quiet --cert-name ${CERT_NAME}
 EOF
-    cat >/etc/systemd/system/mirzabot-cert-renew.timer <<'EOF'
+        cat >/etc/systemd/system/mirzabot-cert-renew.timer <<'EOF'
 [Unit]
 Description=Check Mirza Bot SSL certificate every 6 hours
 
@@ -724,8 +796,26 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now mirzabot-cert-renew.timer >/dev/null 2>&1
+        systemctl daemon-reload
+        systemctl enable --now mirzabot-cert-renew.timer >/dev/null 2>&1
+    else
+        # No systemd: the same job runs from cron.
+        cat >/etc/cron.d/mirzabot-cert-renew <<EOF
+# Managed by the Mirza Bot easy installer
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+17 */6 * * * root ${CERTBOT} renew --quiet --cert-name ${CERT_NAME}
+EOF
+        chmod 644 /etc/cron.d/mirzabot-cert-renew
+        svc_enable_start cron || svc_enable_start crond || true
+    fi
+}
+
+renew_state() {
+    if [[ $HAS_SYSTEMD -eq 1 ]]; then systemctl is-active mirzabot-cert-renew.timer 2>/dev/null || true
+    elif [[ -f /etc/cron.d/mirzabot-cert-renew ]]; then
+        if svc_active cron; then echo "active (cron, every 6h)"; else echo "scheduled, but cron is not running (mirzabot services start)"; fi
+    else echo "inactive"; fi
 }
 
 # Ask Telegram to connect to a static file over HTTPS: proves DNS + port 443 + certificate chain.
@@ -824,7 +914,7 @@ install_cron() {
     [[ -f /etc/cron.deny ]] && sed -i '/^www-data$/d' /etc/cron.deny
     cur=$("$cb" -u www-data -l 2>/dev/null | grep -vF "/cronbot/" || true)
     { [[ -n $cur ]] && printf '%s\n' "$cur"; printf '%s\n' "$line"; } | "$cb" -u www-data - || return 1
-    systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1 || true
+    svc_enable_start cron || svc_enable_start crond || true
     "$cb" -u www-data -l 2>/dev/null | grep -qF "cronbot/run.php"
 }
 
@@ -1101,6 +1191,9 @@ print_summary() {
     msg_kv "Saved in" "$CONF_FILE (root only)"
     msg_kv "Install log" "$LOG_FILE"
     rule
+    if [[ $HAS_SYSTEMD -eq 0 ]]; then
+        msg_warn "This server has no systemd. After every restart run:  mirzabot services start"
+    fi
     printf '  %sManage it any time with:%s\n' "$C_W" "$C_N"
     printf '    %smirzabot%s            interactive menu\n' "$C_C" "$C_N"
     printf '    %smirzabot status%s     health check\n' "$C_C" "$C_N"
@@ -1253,19 +1346,8 @@ cmd_remove() {
 
     [[ -n $TOKEN ]] && run_step "Removing the Telegram webhook" tg_call deleteWebhook || true
     run_step "Removing cron jobs" remove_cron || true
-    run_step "Removing Apache site" bash -c "
-        a2dissite $VHOST_HTTP $VHOST_HTTPS >/dev/null 2>&1; rm -f /etc/apache2/sites-available/$VHOST_HTTP.conf /etc/apache2/sites-available/$VHOST_HTTPS.conf
-        a2disconf mirzabot-security >/dev/null 2>&1; rm -f /etc/apache2/conf-available/mirzabot-security.conf
-        [ \"$(conf_get DISABLED_000_default)\" = 1 ] && a2ensite 000-default >/dev/null 2>&1
-        [ \"$(conf_get DISABLED_default_ssl)\" = 1 ] && a2ensite default-ssl >/dev/null 2>&1
-        rm -f /etc/php/*/*/conf.d/99-mirzabot.ini
-        systemctl reload apache2 >/dev/null 2>&1; true" || true
-    run_step "Removing SSL certificate and renewal timer" bash -c "
-        systemctl disable --now mirzabot-cert-renew.timer >/dev/null 2>&1
-        rm -f /etc/systemd/system/mirzabot-cert-renew.* /etc/letsencrypt/renewal-hooks/deploy/mirzabot-reload.sh; systemctl daemon-reload
-        [ -x '$CERTBOT_VENV/bin/certbot' ] && '$CERTBOT_VENV/bin/certbot' delete --cert-name $CERT_NAME --non-interactive >/dev/null 2>&1
-        command -v certbot >/dev/null && certbot delete --cert-name $CERT_NAME --non-interactive >/dev/null 2>&1
-        rm -rf /opt/mirzabot '$ACME_WEBROOT'; true" || true
+    run_step "Removing Apache site" remove_apache_site || true
+    run_step "Removing SSL certificate and renewal job" remove_ssl_and_renewal || true
 
     if [[ $KEEP_DB -eq 0 && -n $DB_NAME ]] && mysql_root_ok; then
         run_step "Dropping the database and its user" mysql_root -e "DROP DATABASE IF EXISTS \`$DB_NAME\`; DROP USER IF EXISTS '$DB_USER'@'localhost'; FLUSH PRIVILEGES;" || true
@@ -1283,6 +1365,28 @@ cmd_remove() {
     msg_kv "Other backups" "$BACKUP_DIR (not deleted)"
     printf '\n'
     cleanup
+}
+
+remove_apache_site() {
+    a2dissite "$VHOST_HTTP" "$VHOST_HTTPS" >/dev/null 2>&1
+    rm -f "/etc/apache2/sites-available/$VHOST_HTTP.conf" "/etc/apache2/sites-available/$VHOST_HTTPS.conf"
+    a2disconf mirzabot-security >/dev/null 2>&1
+    rm -f /etc/apache2/conf-available/mirzabot-security.conf
+    [[ "$(conf_get DISABLED_000_default)" == 1 ]] && a2ensite 000-default >/dev/null 2>&1
+    [[ "$(conf_get DISABLED_default_ssl)" == 1 ]] && a2ensite default-ssl >/dev/null 2>&1
+    rm -f /etc/php/*/*/conf.d/99-mirzabot.ini
+    svc_reload apache2 >/dev/null 2>&1
+    return 0
+}
+
+remove_ssl_and_renewal() {
+    [[ $HAS_SYSTEMD -eq 1 ]] && systemctl disable --now mirzabot-cert-renew.timer >/dev/null 2>&1
+    rm -f /etc/systemd/system/mirzabot-cert-renew.* /etc/cron.d/mirzabot-cert-renew /etc/letsencrypt/renewal-hooks/deploy/mirzabot-reload.sh
+    [[ $HAS_SYSTEMD -eq 1 ]] && systemctl daemon-reload
+    [[ -x $CERTBOT_VENV/bin/certbot ]] && "$CERTBOT_VENV/bin/certbot" delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1
+    have certbot && certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1
+    rm -rf /opt/mirzabot "$ACME_WEBROOT"
+    return 0
 }
 
 purge_stack() {
@@ -1303,7 +1407,7 @@ purge_stack() {
 # =============================================================================
 #  Commands: status, backup, restore, ssl, webhook, logs, reconfigure
 # =============================================================================
-svc_state() { systemctl is-active --quiet "$1" 2>/dev/null && printf '%srunning%s' "$C_G" "$C_N" || printf '%sstopped%s' "$C_R" "$C_N"; }
+svc_state() { svc_active "$1" && printf '%srunning%s' "$C_G" "$C_N" || printf '%sstopped%s' "$C_R" "$C_N"; }
 
 cmd_status() {
     need_root; load_context; require_installed; banner
@@ -1321,7 +1425,7 @@ cmd_status() {
     if [[ $d == - ]]; then msg_kv "Certificate" "${C_R}not found${C_N}"
     elif ((d < 2)); then msg_kv "Certificate" "${C_Y}${d} day(s) left${C_N}  ($CERT_MODE) - run: mirzabot ssl renew"
     else msg_kv "Certificate" "${C_G}${d} days left${C_N}  ($CERT_MODE)"; fi
-    msg_kv "Auto-renew" "$(systemctl is-active mirzabot-cert-renew.timer 2>/dev/null)"
+    msg_kv "Auto-renew" "$(renew_state)"
     printf '\n  %sTelegram webhook%s\n' "$C_W" "$C_N"
     local info; info=$(webhook_info)
     if [[ -n $info ]]; then
@@ -1382,7 +1486,7 @@ cmd_ssl() {
     CERTBOT="$CERTBOT_VENV/bin/certbot"; [[ -x $CERTBOT ]] || CERTBOT=$(command -v certbot || true)
     local d; d=$(cert_days_left)
     msg_kv "Host" "$HOST"; msg_kv "Mode" "$CERT_MODE"; msg_kv "Days left" "$d"
-    msg_kv "Timer" "$(systemctl is-active mirzabot-cert-renew.timer 2>/dev/null)"
+    msg_kv "Auto-renew" "$(renew_state)"
     if [[ ${EXTRA[0]:-} == renew ]]; then
         [[ -n $CERTBOT ]] || die "certbot not found."
         run_step "Renewing the certificate now" "$CERTBOT" renew --cert-name "$CERT_NAME" --force-renewal || die "Renewal failed (see $LOG_FILE). Rate limits? Try again later."
@@ -1403,6 +1507,22 @@ cmd_webhook() {
     local info; info=$(webhook_info) || die "Could not reach Telegram."
     jq '.result | .url |= sub("secret=[^&]*"; "secret=***")' <<<"$info"
     [[ ${EXTRA[0]:-} == fix ]] || printf '\n  %sRepair with:%s mirzabot webhook fix\n' "$C_D" "$C_N"
+}
+
+cmd_services() {
+    need_root; load_context; require_installed
+    local act=${EXTRA[0]:-status} s db
+    db=$(db_service)
+    case $act in
+        start)   for s in "$db" cron apache2; do run_step "Starting $s" svc_enable_start "$s" || msg_warn "Could not start $s."; done ;;
+        stop)    for s in apache2 cron "$db"; do run_step "Stopping $s" svc_stop "$s" || msg_warn "Could not stop $s."; done ;;
+        restart) for s in "$db" cron apache2; do run_step "Restarting $s" svc_restart "$s" || msg_warn "Could not restart $s."; done ;;
+        status)  ;;
+        *) die "Usage: mirzabot services [start|stop|restart|status]" ;;
+    esac
+    msg_kv "Apache" "$(svc_state apache2)"; msg_kv "Database" "$(svc_state "$db")"; msg_kv "Cron" "$(svc_state cron)"
+    if [[ $HAS_SYSTEMD -eq 0 ]]; then msg_info "No systemd here: after a server/container restart run 'mirzabot services start'."; fi
+    cleanup
 }
 
 cmd_logs() {
@@ -1501,6 +1621,8 @@ COMMANDS
   reconfigure [what]   Change token | admin | address
   ssl [renew]          Show / force-renew the SSL certificate
   webhook [fix]        Show / repair the Telegram webhook
+  services [start|stop|restart|status]
+                       Start/stop Apache, database and cron (handy on servers without systemd)
   logs [app|apache|install]
   self-update          Update this installer script
   version, help
@@ -1542,6 +1664,11 @@ installed_banner_info() {
     fi
 }
 
+read_services_action() {
+    local a; ask a "Action (start/stop/restart/status)" "status"
+    EXTRA=("$a")
+}
+
 show_menu() {
     while true; do
         load_context; clear 2>/dev/null; banner; installed_banner_info
@@ -1557,6 +1684,7 @@ show_menu() {
     ${C_W}8)${C_N} SSL certificate
     ${C_W}9)${C_N} Repair Telegram webhook
     ${C_W}10)${C_N} View logs
+    ${C_W}11)${C_N} Services  (start / stop / restart)
     ${C_W}0)${C_N} Exit
 
 EOF
@@ -1566,6 +1694,7 @@ EOF
             1) ( cmd_install ) ;; 2) ( cmd_update ) ;; 3) ( cmd_remove ) ;; 4) ( cmd_status ) ;;
             5) ( cmd_backup ) ;; 6) ( cmd_restore ) ;; 7) ( cmd_reconfigure ) ;; 8) ( cmd_ssl ) ;;
             9) EXTRA=(fix); ( cmd_webhook ) ;; 10) ( cmd_logs ) ;;
+            11) EXTRA=(); read_services_action; ( cmd_services ) ;;
             0|q|Q|exit) printf '\n'; return 0 ;;
             *) msg_warn "Invalid option." ;;
         esac
@@ -1581,7 +1710,7 @@ parse_args() {
     set -- "${args[@]+"${args[@]}"}"
     while (($#)); do
         case $1 in
-            install|update|remove|uninstall|status|backup|restore|reconfigure|settings|ssl|webhook|logs|menu|self-update|help|version|doctor)
+            install|update|remove|uninstall|status|backup|restore|reconfigure|settings|ssl|webhook|services|logs|menu|self-update|help|version|doctor)
                 if [[ -z $CMD ]]; then CMD=$1; else EXTRA+=("$1"); fi ;;
             --token)   OPT_TOKEN=${2:-}; shift ;;
             --admin)   OPT_ADMIN=${2:-}; shift ;;
@@ -1629,6 +1758,7 @@ main() {
         reconfigure) cmd_reconfigure ;;
         ssl)        cmd_ssl ;;
         webhook)    cmd_webhook ;;
+        services)   cmd_services ;;
         logs)       cmd_logs ;;
         self-update) cmd_self_update ;;
         menu)       need_root; mkdir -p "$(dirname "$LOG_FILE")"
