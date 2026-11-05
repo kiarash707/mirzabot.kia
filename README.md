@@ -168,6 +168,8 @@ Mirza Bot integrates with the most popular VPN and network management panels:
 
 `easy-install.sh` installs, updates, repairs, backs up and removes Mirza Bot on a clean **Ubuntu 22.04 / 24.04** or **Debian 12 / 13** server. It asks only for your **bot token** and **Telegram ID** — everything else (PHP 8.5, Apache, MySQL, database, SSL, cron, webhook) is automatic.
 
+> 🐳 **Works in containers too.** If the server has no systemd (Docker / LXC / Daytona-style containers), the installer automatically uses classic init scripts and cron instead. Such servers don't restart services by themselves — run `mirzabot services start` after every restart. The bot still needs a **public IPv4** with ports **80/443** reachable from the internet, because Telegram connects to it.
+
 Run as **root**:
 
 ```bash
@@ -197,6 +199,7 @@ mirzabot restore          restore a backup
 mirzabot reconfigure      change token / admin / address
 mirzabot ssl [renew]      SSL status / force renewal
 mirzabot webhook [fix]    show / repair the Telegram webhook
+mirzabot services [start|stop|restart|status]   Apache / database / cron
 mirzabot logs             bot / Apache / installer logs
 mirzabot help             all options
 ```
@@ -335,6 +338,7 @@ mirza remove
 16. [عیب‌یابی](#fa-16)
 17. [سؤالات پرتکرار](#fa-17)
 18. [نکات امنیتی](#fa-18)
+19. [نصب روی کانتینر (بدون systemd)](#fa-19)
 
 ---
 
@@ -373,7 +377,8 @@ mirza remove
 | 💽 **فضای دیسک** | حداقل ۲ گیگابایت خالی (۱۰ گیگ یا بیشتر پیشنهاد می‌شود) |
 | 🌍 **موقعیت سرور** | **خارج از ایران** (سرور باید به `api.telegram.org` دسترسی داشته باشد) |
 | 🌐 **IP** | یک IPv4 عمومی (سرور فقط‌IPv6 یا پشت NAT خصوصی پشتیبانی نمی‌شود) |
-| 🔓 **پورت‌ها** | ۸۰ و ۴۴۳ باید باز باشند (در پنل فایروال سرویس‌دهنده هم) |
+| 🔓 **پورت‌ها** | ۸۰ و ۴۴۳ باید از اینترنت قابل دسترس باشند (در پنل فایروال سرویس‌دهنده هم) |
+| 🐳 **کانتینر** | اگر سرور شما کانتینر است (Docker، LXC، Daytona و...) و `systemd` ندارد، نصب‌کننده خودکار از `service` و `cron` استفاده می‌کند. فقط حتماً باید آی‌پی عمومی و پورت‌های باز داشته باشد ([توضیح](#fa-19)) |
 | 👤 **دسترسی** | کاربر `root` |
 | 🌐 **دامنه** | **لازم نیست** ✅ |
 
@@ -593,6 +598,7 @@ mirzabot
 | `mirzabot reconfigure address` | تغییر آدرس (خودکار ⇄ دامنه) |
 | `mirzabot ssl` / `mirzabot ssl renew` | وضعیت SSL / تمدید فوری |
 | `mirzabot webhook` / `mirzabot webhook fix` | نمایش / تعمیر وب‌هوک تلگرام |
+| `mirzabot services start` / `stop` / `restart` / `status` | روشن، خاموش یا ری‌استارت Apache، دیتابیس و کرون |
 | `mirzabot logs` | دیدن لاگ ربات، آپاچی یا نصب |
 | `mirzabot remove` | حذف ربات |
 | `mirzabot help` | همهٔ گزینه‌ها |
@@ -748,6 +754,7 @@ mirzabot status
 | `Port 80/443 is already used by 'nginx'` | وب‌سرور دیگری روی سرور هست | `systemctl disable --now nginx` یا یک سرور تمیز بگیرید |
 | `Telegram rejected this token` | توکن اشتباه تایپ شده یا در BotFather ابطال (Revoke) شده | توکن را دوباره از BotFather کپی کنید |
 | `HTTPS could not be set up` | پورت ۸۰/۴۴۳ بسته است، یا سقف درخواست Let's Encrypt پر شده، یا DNS دامنه درست نیست | پورت‌ها را در فایروال سرویس‌دهنده باز کنید؛ یک ساعت بعد دوباره تلاش کنید؛ یا دامنهٔ شخصی بدهید: `mirzabot install --domain bot.example.com` |
+| `No systemd found (container?)` | هشدار است نه خطا: سرور شما کانتینر است | ادامه دهید. بعد از هر ری‌استارتِ سرور بزنید: `mirzabot services start` |
 | `PHP 8.5.12+ is not available` | مخزن PHP برای این نسخهٔ سیستم‌عامل در دسترس نیست | از Ubuntu 22.04/24.04 یا Debian 12/13 استفاده کنید |
 | ربات جواب نمی‌دهد | وب‌هوک مشکل دارد | `mirzabot webhook fix` سپس `mirzabot status` |
 | `Last error: ... SSL ...` در status | گواهی تمدید نشده یا مشکل شبکه | `mirzabot ssl renew` |
@@ -795,6 +802,9 @@ mirzabot logs install    # لاگ نصب
 **چند ربات روی یک سرور می‌شود؟**
 این نصب‌کننده یک نصب برای هر سرور مدیریت می‌کند. «ربات‌ساز/نماینده‌ها» داخل خود ربات (منوی نمایندگی) انجام می‌شود و در بکاپ و آپدیت حفظ می‌شود.
 
+**روی کانتینر (Docker / Daytona / LXC) هم نصب می‌شود؟**
+بله. اگر `systemd` نباشد، نصب‌کننده خودش از اسکریپت‌های `service` و `cron` استفاده می‌کند. نکته‌ها در [بخش ۱۹](#fa-19) آمده است.
+
 **حتماً باید Ubuntu باشد؟**
 Ubuntu 22.04/24.04 تست‌شده‌ترین است؛ Debian 12/13 هم پشتیبانی می‌شود. سایر سیستم‌عامل‌ها فقط با `--force` و با مسئولیت خودتان.
 
@@ -810,6 +820,38 @@ Ubuntu 22.04/24.04 تست‌شده‌ترین است؛ Debian 12/13 هم پشت�
 - 💾 هفتگی بکاپ بگیرید و **خارج از سرور** نگه دارید (`mirzabot backup`).
 - 🗄️ دیتابیس فقط روی `localhost` در دسترس است و کاربر مخصوص خودش را دارد؛ رمز تصادفی ۳۲ کاراکتری است.
 - ♻️ سیستم را به‌روز نگه دارید: `apt update && apt upgrade -y` و بعد `mirzabot update`.
+
+---
+
+<a id="fa-19"></a>
+
+### ۱۹. نصب روی کانتینر (سرور بدون systemd)
+
+بعضی سرورها در واقع **کانتینر** هستند (Docker، LXC، Daytona، بعضی VPSهای ارزان OpenVZ). علامتش این است که این دستور خطا می‌دهد:
+
+```bash
+ls /run/systemd/system
+```
+
+در این حالت نصب‌کننده خودکار حالت جایگزین را روشن می‌کند و این پیام را نشان می‌دهد:
+
+```text
+! No systemd found (container?). Using classic init scripts and cron instead.
+```
+
+| موضوع | در سرور معمولی (systemd) | در کانتینر (بدون systemd) |
+|-------|--------------------------|----------------------------|
+| روشن‌کردن Apache، MySQL و کرون | `systemctl` | `service` / `/etc/init.d` |
+| تمدید خودکار SSL | تایمر systemd | یک کار `cron` در `/etc/cron.d/mirzabot-cert-renew` |
+| بعد از ری‌استارت سرور | خودکار بالا می‌آید | باید بزنید: `mirzabot services start` |
+| Swap خودکار | ساخته می‌شود | ساخته نمی‌شود (کانتینر اجازه نمی‌دهد) |
+
+**شرط اصلی:** تلگرام باید بتواند از اینترنت به ربات شما وصل شود؛ پس لازم است:
+
+1. کانتینر یک **آی‌پی عمومی IPv4** داشته باشد، یا پورت‌های **۸۰ و ۴۴۳** از سرور اصلی به کانتینر فوروارد شوند.
+2. این پورت‌ها در فایروال سرویس‌دهنده باز باشند.
+
+اگر کانتینر شما آی‌پی عمومی ندارد، گواهی SSL صادر نمی‌شود و ربات پیامی دریافت نمی‌کند؛ این محدودیت سرویس‌دهنده است و از دست نصب‌کننده خارج است. در این حالت از یک VPS واقعی (KVM) استفاده کنید.
 
 </div>
 
